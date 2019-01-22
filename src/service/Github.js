@@ -1,6 +1,12 @@
 import Octokit from '@octokit/rest';
+import NodeCache from 'node-cache';
 import parse from 'parse-diff';
 import {bitbucket, github} from '../../config';
+const cache = new NodeCache();
+
+const NotInlineCommentException = {
+  name: 'Not Inline Comment'
+};
 
 const BASE_URL = 'https://api.github.com';
 
@@ -46,11 +52,15 @@ export default class Github {
     return last.previousFromHash;
   };
 
-  findLinePosition = async (number, {path, line, lineType}) => {
-    if (lineType === 'CONTEXT') {
-      return line;
+  getPrDiff = async (number, commitId) => {
+    const cacheKey = `${this.repoName}:${number}:${commitId}`;
+    const diff = cache.get(cacheKey);
+
+    if (diff) {
+      return diff;
     }
-    const diffResult = await this.octokit.pulls.get({
+
+    const {data} = await this.octokit.pulls.get({
       owner: github.username,
       repo: this.repoName,
       number,
@@ -58,10 +68,31 @@ export default class Github {
         accept: 'application/vnd.github.v3.diff'
       }
     });
-    const parsed = parse(diffResult.data);
+
+    cache.set(cacheKey, data);
+    return data;
+  };
+
+  findLinePosition = async (number, commitId, commentAnchor) => {
+    if (!commentAnchor) {
+      throw NotInlineCommentException
+    }
+
+    const {path, line, lineType} = commentAnchor;
+    if (lineType === 'CONTEXT') {
+      return line;
+    }
+
+    const diff = await this.getPrDiff(number, commitId);
+    const parsed = parse(diff);
     const fileDiff = parsed.find(file => file.to === path);
-    const changes = [].concat.apply([], fileDiff.chunks.map(chunk => chunk.changes));
-    return changes.findIndex(change => change.ln === line && change.type === 'add') + fileDiff.chunks.length;
+    if (!fileDiff) {
+      throw NotInlineCommentException;
+    }
+
+    const changes = [].concat.apply([], fileDiff.chunks.map(chunk => [{}, ...chunk.changes]));
+    const index = changes.findIndex(change => change.ln === line && change.type === 'add');
+    return index !== -1 ? index : 0;
   };
 
   import = async (url) => {
@@ -82,7 +113,7 @@ export default class Github {
         vcs_password: bitbucket.password
       });
     } catch (e) {
-      console.error(`[FAILED] Importing ${repoName} to github with error:`, e);
+      console.error(`[FAILED] Importing ${this.repoName} to github with error:`, e);
       throw e;
     }
   };
@@ -93,75 +124,88 @@ export default class Github {
     const initCommit = this.getInitialPrCommit(fromRef.latestCommit, activities.reScopes);
 
     // Create ref for pull request
-    // await this.createRef(fromRef.id, initCommit);
-    // await this.createRef(toRef.id + id, toRef.latestCommit);
+    await this.createRef(fromRef.id, initCommit);
+    await this.createRef(toRef.id + id, toRef.latestCommit);
 
     // Create pull request
-    // const {data: {number: prId}} = await this.createPr(repoName, title, fromRef.displayId, toRef.displayId + id);
+    const {data: {number: prId}} = await this.createPr(title, fromRef.displayId, toRef.displayId + id);
+
     return {
-      id: 2,
+      id: prId,
       initCommit: initCommit
     };
-    // Update ref to keep the outdated commit in pr
-    // if (activities.res.length !== 0) {
-    //   for (const reScope of activities.reScopes.reverse()) {
-    //     if (reScope.fromHash !== startSha) {
-    //       await this.octokit.git.updateRef({
-    //         owner: github.username,
-    //         repo: this.repoName,
-    //         ref: fromRef.id.replace('refs/', ''),
-    //         sha: reScope.fromHash,
-    //         force: true
-    //       })
-    //     }
-    //   }
-    // }
-
-    // console.log('##### number', number);
   };
 
-  importPrActivities = async (prContext, {activities}) => {
+  addCommentReplies = async (prId, commentId, replies) => {
+    for (const reply of replies) {
+      await this.octokit.pulls.createCommentReply({
+        owner: github.username,
+        repo: this.repoName,
+        number: prId,
+        body: `@${reply.author.name}: ${reply.text}`,
+        in_reply_to: commentId
+      })
+    }
+  };
+
+  updatePrRef = async (commitId, ref) => {
+    await this.octokit.git.updateRef({
+      owner: github.username,
+      repo: this.repoName,
+      ref,
+      sha: commitId,
+      force: true
+    })
+  };
+
+  addPrComment = async (prId, username, comment) => {
+    const {id: commentId} = await this.octokit.issues.createComment({
+      owner: github.username,
+      repo: this.repoName,
+      number: prId,
+      body: `@${username}: ${comment.text}`
+    });
+    if (comment.comments.length) {
+      await this.addCommentReplies(id, commentId, comment.comments);
+    }
+  };
+
+  importPrActivities = async (prContext, {activities, fromRef}) => {
     const {id, initCommit} = prContext;
+    let currentCommit = initCommit;
 
     for (const activity of activities.comments.reverse()) {
+      const {user, comment, commentAnchor, commitId} = activity;
+
       try {
-        const {user, comment, commentAnchor, commitId} = activity;
-        if (commentAnchor && commitId === initCommit) {
-          const position = await this.findLinePosition(id, commentAnchor);
-          const {id: commentId} = await this.octokit.pulls.createComment({
-            owner: github.username,
-            repo: this.repoName,
-            number: id,
-            body: `@${user.name}: ${comment.text}`,
-            commit_id: commitId,
-            path: commentAnchor.path,
-            position
-          });
+        if (commitId !== currentCommit) {
+          await this.updatePrRef(commitId, fromRef.id.replace('refs/', ''));
+          currentCommit = commitId;
         }
-        // else {
-        // const {id: commentId} = await this.octokit.issues.createComment({
-        //   owner: github.username,
-        //   repo: this.repoName,
-        //   number,
-        //   body: `@${user.name}: ${comment.text}`
-        // });
-        //
-        // replyTo = commentId;
-        // }
+
+        const position = await this.findLinePosition(id, commitId, commentAnchor);
+        const {data: {id: commentId}} = await this.octokit.pulls.createComment({
+          owner: github.username,
+          repo: this.repoName,
+          number: id,
+          body: `@${user.name}: ${comment.text}`,
+          commit_id: commitId,
+          path: commentAnchor.path,
+          position
+        });
+        if (comment.comments.length) {
+          await this.addCommentReplies(id, commentId, comment.comments);
+        }
       } catch (e) {
-        console.error(`[FAILED] Importing activities to github with error:`, e.errors[0].message ? e.errors[0].message : e);
+        if (e.name === NotInlineCommentException.name) {
+          await this.addPrComment(id, user.name, comment);
+        } else {
+          console.error(`[FAILED] Importing activities to github with error:`, e);
+        }
       }
     }
-    // if (comment.comments.length) {
-    //   comment.comments.map(async commentReplies => {
-    //     await this.octokit.pulls.createCommentReply({
-    //       owner: github.username,
-    //       repo: this.repoName,
-    //       number,
-    //       body: `@${commentReplies.user.name}: ${commentReplies.comment.text}`,
-    //       in_reply_to: replyTo
-    //     })
-    //   })
-    // }
+    if (fromRef.latestCommit !== initCommit) {
+      await this.updatePrRef(fromRef.latestCommit, fromRef.id.replace('refs/', ''));
+    }
   }
 }
