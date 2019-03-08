@@ -8,8 +8,6 @@ const NotInlineCommentException = {
   name: 'Not Inline Comment'
 };
 
-const BASE_URL = 'https://api.github.com';
-
 export default class Github {
   octokit;
   repoName;
@@ -95,7 +93,7 @@ export default class Github {
     return index !== -1 ? index : 0;
   };
 
-  import = async (url) => {
+  importRepo = async (url) => {
     try {
       await this.octokit.repos.createForAuthenticatedUser({
         name: this.repoName,
